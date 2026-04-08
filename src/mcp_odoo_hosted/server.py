@@ -15,6 +15,7 @@ Endpoints
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -100,6 +101,17 @@ async def root(request: Request) -> JSONResponse:
 def create_app() -> Starlette:
     mcp_asgi = mcp.streamable_http_app()
 
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
+        logger.info("=" * 50)
+        logger.info("MCP Odoo Hosted — démarrage")
+        logger.info("Endpoint MCP   : %s/mcp", settings.server_url)
+        logger.info("OAuth metadata : %s/.well-known/oauth-authorization-server", settings.server_url)
+        logger.info("Client ID      : %s", settings.oauth_client_id)
+        logger.info("Client Secret  : %s", settings.oauth_client_secret)
+        logger.info("=" * 50)
+        yield
+
     routes = [
         Route("/", root),
         Route("/health", health),
@@ -139,20 +151,7 @@ def create_app() -> Starlette:
         Middleware(BearerTokenMiddleware),
     ]
 
-    app = Starlette(routes=routes, middleware=middleware)
-
-    @app.on_event("startup")
-    async def on_startup() -> None:
-        logger.info("=" * 50)
-        logger.info("MCP Odoo Hosted — démarrage")
-        logger.info("Endpoint MCP   : %s/mcp", settings.server_url)
-        logger.info("OAuth metadata : %s/.well-known/oauth-authorization-server",
-                    settings.server_url)
-        logger.info("Client ID      : %s", settings.oauth_client_id)
-        logger.info("Client Secret  : %s", settings.oauth_client_secret)
-        logger.info("=" * 50)
-
-    return app
+    return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 app = create_app()
