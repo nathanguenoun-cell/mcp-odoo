@@ -105,8 +105,8 @@ def create_app() -> Starlette:
     async def lifespan(app: Starlette):
         logger.info("=" * 50)
         logger.info("MCP Odoo Hosted — démarrage")
-        logger.info("Endpoint MCP   : %s/mcp", settings.server_url)
-        logger.info("OAuth metadata : %s/.well-known/oauth-authorization-server", settings.server_url)
+        logger.info("Endpoint MCP   : %s/mcp", settings.server_url or "<auto-detected from request>")
+        logger.info("OAuth metadata : %s/.well-known/oauth-authorization-server", settings.server_url or "<auto-detected from request>")
         logger.info("Client ID      : %s", settings.oauth_client_id)
         logger.info("Client Secret  : %s", settings.oauth_client_secret)
         logger.info("=" * 50)

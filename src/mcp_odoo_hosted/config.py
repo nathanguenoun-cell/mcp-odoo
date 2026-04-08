@@ -33,7 +33,9 @@ class Settings(BaseSettings):
     # ── Server ────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000
-    server_url: str = Field(..., description="Public base URL of this MCP server")
+    # SERVER_URL is optional: if not set (or left empty) the server auto-detects
+    # its public URL from the incoming request's Host header at runtime.
+    server_url: str = Field(default="", description="Public base URL of this MCP server (optional, auto-detected from request if empty)")
 
     # ── Redis (optional) ──────────────────────────────────────────────────
     redis_enabled: bool = False
@@ -47,7 +49,7 @@ class Settings(BaseSettings):
     @field_validator("server_url")
     @classmethod
     def strip_trailing_slash(cls, v: str) -> str:
-        return v.rstrip("/")
+        return v.rstrip("/") if v else ""
 
     @field_validator("odoo_url")
     @classmethod
