@@ -27,8 +27,11 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60
 
     # OAuth client app credentials (used by the web app to obtain tokens)
-    oauth_client_id: str = Field(..., description="Client ID for your web application")
-    oauth_client_secret: str = Field(..., description="Client secret for your web application")
+    oauth_client_id: str = Field(default="mcp-client", description="Client ID for your web application")
+    oauth_client_secret: str = Field(
+        default_factory=lambda: secrets.token_urlsafe(32),
+        description="Client secret for your web application (set via OAUTH_CLIENT_SECRET env var)",
+    )
 
     # ── Server ────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"
