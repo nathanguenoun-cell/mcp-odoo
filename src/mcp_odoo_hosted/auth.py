@@ -40,6 +40,17 @@ from .config import settings
 from .context import odoo_api_key_var, odoo_username_var
 
 
+def _base_url(request: Request) -> str:
+    """Return the server's public base URL.
+
+    Uses SERVER_URL from config when set; otherwise auto-detects from the
+    incoming request's scheme and host (handles Railway/proxy URL changes).
+    """
+    if settings.server_url:
+        return settings.server_url
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
 # ---------------------------------------------------------------------------
 # In-memory stores
 # ---------------------------------------------------------------------------
@@ -141,7 +152,7 @@ def _client_exists(client_id: str) -> bool:
 
 async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
     """RFC 9728 — Dust appelle cet endpoint EN PREMIER pour découvrir l'auth server."""
-    base = settings.server_url
+    base = _base_url(request)
     return JSONResponse({
         "resource": f"{base}/mcp",
         "authorization_servers": [base],
@@ -152,7 +163,7 @@ async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
 
 async def oauth_metadata(request: Request) -> JSONResponse:
     """RFC 8414 — Authorization Server Metadata."""
-    base = settings.server_url
+    base = _base_url(request)
     return JSONResponse({
         "issuer": base,
         "authorization_endpoint": f"{base}/oauth/authorize",
@@ -380,13 +391,14 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             # WWW-Authenticate avec resource_metadata pour la découverte primaire
+            base = _base_url(request)
             return JSONResponse(
                 {"error": "unauthorized", "error_description": "Bearer token requis."},
                 status_code=401,
                 headers={
                     "WWW-Authenticate": (
-                        f'Bearer realm="{settings.server_url}", '
-                        f'resource_metadata="{settings.server_url}/.well-known/oauth-protected-resource"'
+                        f'Bearer realm="{base}", '
+                        f'resource_metadata="{base}/.well-known/oauth-protected-resource"'
                     )
                 },
             )
