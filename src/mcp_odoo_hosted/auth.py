@@ -201,10 +201,12 @@ async def oauth_register(request: Request) -> JSONResponse:
         "registered_at": time.time(),
     }
 
+    now = int(time.time())
     return JSONResponse({
         "client_id": client_id,
         "client_secret": client_secret,
-        "client_id_issued_at": int(time.time()),
+        "client_id_issued_at": now,
+        "client_secret_expires_at": 0,          # 0 = never expires (RFC 7591 §3.2.1)
         "redirect_uris": body.get("redirect_uris", []),
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
