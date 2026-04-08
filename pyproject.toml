@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 name = "mcp-odoo-hosted"
 version = "1.0.0"
 description = "Odoo MCP server — Streamable HTTP transport with OAuth 2.0 (hosted on Railway)"
-readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 
