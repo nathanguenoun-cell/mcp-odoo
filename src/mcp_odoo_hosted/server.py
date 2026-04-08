@@ -105,9 +105,13 @@ def create_app() -> Starlette:
         Route("/", root),
         Route("/health", health),
         # RFC 9728 — Protected Resource Metadata (MCP clients check this FIRST)
+        # Exposed at root AND under /mcp/ because some clients derive the path
+        # from the MCP endpoint URL (e.g. https://host/mcp → looks at /mcp/.well-known/…)
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource_metadata, methods=["GET"]),
+        Route("/mcp/.well-known/oauth-protected-resource", oauth_protected_resource_metadata, methods=["GET"]),
         # RFC 8414 — Authorization Server Metadata
         Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+        Route("/mcp/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
         Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         Route("/oauth/revoke", oauth_revoke, methods=["POST"]),

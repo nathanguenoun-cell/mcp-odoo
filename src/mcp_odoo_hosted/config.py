@@ -1,9 +1,10 @@
 """Configuration management via environment variables."""
 from __future__ import annotations
 
+import hashlib
+import os
 import secrets
-from typing import Optional
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -13,12 +14,10 @@ class Settings(BaseSettings):
     odoo_db: str = Field(..., description="Odoo database name")
 
     # ── OAuth 2.0 ─────────────────────────────────────────────────────────
-    # For Authorization Code flow, each user will have their own Odoo API key
-    # stored in the user store. These are the defaults / admin credentials.
     odoo_admin_username: str = Field(..., description="Odoo admin username (email)")
     odoo_admin_api_key: str = Field(..., description="Odoo admin API key")
 
-    # JWT signing secret (generate a strong random value in production)
+    # JWT signing secret — set JWT_SECRET_KEY in Railway to make tokens persistent
     jwt_secret_key: str = Field(
         default_factory=lambda: secrets.token_urlsafe(32),
         description="Secret key for signing JWT access tokens",
@@ -26,27 +25,25 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 
-    # OAuth client app credentials (used by the web app to obtain tokens)
-    oauth_client_id: str = Field(default="mcp-client", description="Client ID for your web application")
-    oauth_client_secret: str = Field(
-        default_factory=lambda: secrets.token_urlsafe(32),
-        description="Client secret for your web application (set via OAUTH_CLIENT_SECRET env var)",
-    )
+    # OAuth client credentials — set OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET in Railway
+    # If not set, they are derived deterministically from jwt_secret_key so they
+    # remain stable across restarts as long as JWT_SECRET_KEY is fixed.
+    oauth_client_id: str = Field(default="mcp-client")
+    oauth_client_secret: str = Field(default="")  # filled by model_validator below
 
     # ── Server ────────────────────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000
-    # Public URL of this server, used in OAuth metadata (e.g. https://mcp.myapp.com)
     server_url: str = Field(..., description="Public base URL of this MCP server")
 
-    # ── Redis (optional caching) ──────────────────────────────────────────
+    # ── Redis (optional) ──────────────────────────────────────────────────
     redis_enabled: bool = False
     redis_url: str = "redis://localhost:6379"
-    redis_default_ttl: int = 300  # seconds
+    redis_default_ttl: int = 300
 
     # ── Logging ───────────────────────────────────────────────────────────
     log_level: str = "INFO"
-    log_format: str = "json"  # "json" | "text"
+    log_format: str = "json"
 
     @field_validator("server_url")
     @classmethod
@@ -57,6 +54,20 @@ class Settings(BaseSettings):
     @classmethod
     def strip_odoo_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @model_validator(mode="after")
+    def derive_oauth_secret(self) -> "Settings":
+        """
+        If OAUTH_CLIENT_SECRET is not set as an env var, derive it
+        deterministically from jwt_secret_key so it stays stable across
+        restarts (as long as JWT_SECRET_KEY is fixed in Railway).
+        """
+        if not os.environ.get("OAUTH_CLIENT_SECRET"):
+            derived = hashlib.sha256(
+                f"oauth_client_secret:{self.jwt_secret_key}".encode()
+            ).hexdigest()
+            self.oauth_client_secret = derived
+        return self
 
     model_config = {"env_file": ".env", "case_sensitive": False, "extra": "ignore"}
 

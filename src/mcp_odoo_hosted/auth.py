@@ -278,6 +278,8 @@ _OPEN_PATHS = frozenset(
     [
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
+        "/mcp/.well-known/oauth-authorization-server",
+        "/mcp/.well-known/oauth-protected-resource",
         "/oauth/token",
         "/oauth/authorize",
         "/oauth/revoke",
