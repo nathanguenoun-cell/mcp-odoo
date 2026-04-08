@@ -21,6 +21,7 @@ import logging
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -114,6 +115,14 @@ def create_app() -> Starlette:
     ]
 
     middleware = [
+        # CORS must be first so preflight OPTIONS requests are handled before auth
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],        # Restrict to your domain(s) in production
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        ),
         Middleware(BearerTokenMiddleware),
     ]
 
