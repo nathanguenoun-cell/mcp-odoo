@@ -23,8 +23,6 @@ def register(mcp: FastMCP) -> None:
         search: Optional[str] = None,
         active: bool = True,
         limit: int = 100,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """List employees."""
         domain: list = [["active", "=", active]]
@@ -33,7 +31,7 @@ def register(mcp: FastMCP) -> None:
         if search:
             domain.append(["name", "ilike", search])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "hr.employee",
             domain=domain,
@@ -48,13 +46,9 @@ def register(mcp: FastMCP) -> None:
         return records
 
     @mcp.tool()
-    def get_employee(
-        employee_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def get_employee(employee_id: int) -> dict:
         """Return full details of an employee."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.read("hr.employee", [employee_id], fields=_EMP_FIELDS)
         if not records:
             return {"error": f"Employee {employee_id} not found"}
@@ -67,16 +61,12 @@ def register(mcp: FastMCP) -> None:
     # ── Departments ───────────────────────────────────────────────────
 
     @mcp.tool()
-    def list_departments(
-        search: Optional[str] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> list:
+    def list_departments(search: Optional[str] = None) -> list:
         """List HR departments."""
         domain: list = []
         if search:
             domain.append(["name", "ilike", search])
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.search_read(
             "hr.department",
             domain=domain,
@@ -88,12 +78,9 @@ def register(mcp: FastMCP) -> None:
     # ── Leave / Time-off ──────────────────────────────────────────────
 
     @mcp.tool()
-    def list_leave_types(
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> list:
+    def list_leave_types() -> list:
         """List available leave (time-off) types."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.search_read(
             "hr.leave.type",
             domain=[["active", "=", True]],
@@ -107,8 +94,6 @@ def register(mcp: FastMCP) -> None:
         employee_id: Optional[int] = None,
         holiday_status_id: Optional[int] = None,
         state: Optional[str] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List leave allocations.
@@ -126,7 +111,7 @@ def register(mcp: FastMCP) -> None:
         if state:
             domain.append(["state", "=", state])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.search_read(
             "hr.leave.allocation",
             domain=domain,
@@ -145,8 +130,6 @@ def register(mcp: FastMCP) -> None:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         notes: Optional[str] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """
         Create a leave allocation for an employee.
@@ -171,18 +154,14 @@ def register(mcp: FastMCP) -> None:
         if notes:
             values["notes"] = notes
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         new_id = client.create("hr.leave.allocation", values)
         return {"id": new_id, "employee_id": employee_id, "days": number_of_days}
 
     @mcp.tool()
-    def approve_leave_allocation(
-        allocation_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def approve_leave_allocation(allocation_id: int) -> dict:
         """Approve (validate) a leave allocation."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         client.call("hr.leave.allocation", "action_validate", [allocation_id])
         return {"id": allocation_id, "state": "validate"}
 
@@ -192,15 +171,13 @@ def register(mcp: FastMCP) -> None:
     def list_public_holidays(
         year: Optional[int] = None,
         country_id: Optional[int] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """List public holidays."""
         domain: list = []
         if country_id:
             domain.append(["country_id", "=", country_id])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         lines = client.search_read(
             "resource.calendar.leaves",
             domain=domain,
@@ -218,8 +195,6 @@ def register(mcp: FastMCP) -> None:
         date_from: str,
         date_to: str,
         company_id: Optional[int] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """
         Create a global public holiday.
@@ -234,6 +209,6 @@ def register(mcp: FastMCP) -> None:
         if company_id:
             values["company_id"] = company_id
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         new_id = client.create("resource.calendar.leaves", values)
         return {"id": new_id, "name": name}

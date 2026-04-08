@@ -23,8 +23,6 @@ def register(mcp: FastMCP) -> None:
         date_to: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List sales orders.
@@ -45,7 +43,7 @@ def register(mcp: FastMCP) -> None:
         if date_to:
             domain.append(["date_order", "<=", date_to])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "sale.order",
             domain=domain,
@@ -62,13 +60,9 @@ def register(mcp: FastMCP) -> None:
         return records
 
     @mcp.tool()
-    def get_sale_order(
-        order_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def get_sale_order(order_id: int) -> dict:
         """Return full details of a sale order including its lines."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.read("sale.order", [order_id], fields=_FIELDS)
         if not records:
             return {"error": f"Sale order {order_id} not found"}

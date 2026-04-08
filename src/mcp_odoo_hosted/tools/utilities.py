@@ -10,12 +10,9 @@ from ._base import admin_client, user_client
 def register(mcp: FastMCP) -> None:
 
     @mcp.tool()
-    def test_connection(
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def test_connection() -> dict:
         """Test the connection to the Odoo instance and return server info."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.test_connection()
 
     @mcp.tool()
@@ -26,8 +23,6 @@ def register(mcp: FastMCP) -> None:
         limit: int = 20,
         offset: int = 0,
         order: Optional[str] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         Generic search on any Odoo model.
@@ -40,7 +35,7 @@ def register(mcp: FastMCP) -> None:
             offset:  Pagination offset
             order:   Sort expression, e.g. "name asc"
         """
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.search_read(
             model,
             domain=domain or [],
@@ -51,11 +46,7 @@ def register(mcp: FastMCP) -> None:
         )
 
     @mcp.tool()
-    def get_model_fields(
-        model: str,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def get_model_fields(model: str) -> dict:
         """Return the field definitions for an Odoo model."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.fields_get(model, attributes=["string", "type", "required", "readonly"])

@@ -23,8 +23,6 @@ def register(mcp: FastMCP) -> None:
         date_to: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List timesheets.
@@ -49,7 +47,7 @@ def register(mcp: FastMCP) -> None:
         if date_to:
             domain.append(["date", "<=", date_to])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "account.analytic.line",
             domain=domain,
@@ -69,8 +67,6 @@ def register(mcp: FastMCP) -> None:
         date_from: str,
         date_to: str,
         project_id: Optional[int] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         Return total hours per employee for a date range.
@@ -88,7 +84,7 @@ def register(mcp: FastMCP) -> None:
         if project_id:
             domain.append(["project_id", "=", project_id])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "account.analytic.line",
             domain=domain,
@@ -114,8 +110,6 @@ def register(mcp: FastMCP) -> None:
         hours: float,
         description: Optional[str] = None,
         task_id: Optional[int] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """
         Create a new timesheet entry.
@@ -138,7 +132,7 @@ def register(mcp: FastMCP) -> None:
         if task_id:
             values["task_id"] = task_id
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         new_id = client.create("account.analytic.line", values)
         return {"id": new_id, "date": date, "hours": hours}
 
@@ -150,8 +144,6 @@ def register(mcp: FastMCP) -> None:
         description: Optional[str] = None,
         task_id: Optional[int] = None,
         project_id: Optional[int] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """Update an existing timesheet entry."""
         values: dict = {}
@@ -169,17 +161,13 @@ def register(mcp: FastMCP) -> None:
         if not values:
             return {"error": "No fields to update"}
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         client.write("account.analytic.line", [timesheet_id], values)
         return {"id": timesheet_id, "updated": list(values.keys())}
 
     @mcp.tool()
-    def delete_timesheet(
-        timesheet_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def delete_timesheet(timesheet_id: int) -> dict:
         """Delete a timesheet entry by ID."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         client.unlink("account.analytic.line", [timesheet_id])
         return {"id": timesheet_id, "deleted": True}

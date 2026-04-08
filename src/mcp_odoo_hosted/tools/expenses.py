@@ -17,12 +17,9 @@ _FIELDS = [
 def register(mcp: FastMCP) -> None:
 
     @mcp.tool()
-    def list_expense_categories(
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> list:
+    def list_expense_categories() -> list:
         """List available expense categories (products configured as expenses)."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.search_read(
             "product.product",
             domain=[["can_be_expensed", "=", True]],
@@ -39,8 +36,6 @@ def register(mcp: FastMCP) -> None:
         date_to: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List expense records.
@@ -61,7 +56,7 @@ def register(mcp: FastMCP) -> None:
         if date_to:
             domain.append(["date", "<=", date_to])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "hr.expense",
             domain=domain,
@@ -86,8 +81,6 @@ def register(mcp: FastMCP) -> None:
         description: Optional[str] = None,
         payment_mode: str = "own_account",
         quantity: float = 1.0,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """
         Create a new expense.
@@ -114,7 +107,7 @@ def register(mcp: FastMCP) -> None:
         if description:
             values["description"] = description
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         new_id = client.create("hr.expense", values)
         return {"id": new_id, "name": name}
 
@@ -126,8 +119,6 @@ def register(mcp: FastMCP) -> None:
         date: Optional[str] = None,
         description: Optional[str] = None,
         quantity: Optional[float] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """Update an existing expense (only while in draft state)."""
         values: dict = {}
@@ -145,29 +136,21 @@ def register(mcp: FastMCP) -> None:
         if not values:
             return {"error": "No fields to update"}
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         client.write("hr.expense", [expense_id], values)
         return {"id": expense_id, "updated": list(values.keys())}
 
     @mcp.tool()
-    def delete_expense(
-        expense_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def delete_expense(expense_id: int) -> dict:
         """Delete a draft expense."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         client.unlink("hr.expense", [expense_id])
         return {"id": expense_id, "deleted": True}
 
     @mcp.tool()
-    def list_expense_attachments(
-        expense_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> list:
+    def list_expense_attachments(expense_id: int) -> list:
         """List attachments on an expense."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.search_read(
             "ir.attachment",
             domain=[["res_model", "=", "hr.expense"], ["res_id", "=", expense_id]],
@@ -180,8 +163,6 @@ def register(mcp: FastMCP) -> None:
         filename: str,
         file_content_base64: str,
         mimetype: str = "application/octet-stream",
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """
         Attach a file to an expense.
@@ -192,7 +173,7 @@ def register(mcp: FastMCP) -> None:
             file_content_base64:  Base64-encoded file content
             mimetype:             MIME type (e.g. "application/pdf")
         """
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         new_id = client.create(
             "ir.attachment",
             {
