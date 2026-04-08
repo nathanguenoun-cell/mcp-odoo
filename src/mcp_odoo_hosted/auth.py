@@ -1,23 +1,30 @@
 """
-OAuth 2.0 Authorization Server implementation for mcp-odoo-hosted.
+OAuth 2.0 Authorization Server — mcp-odoo-hosted
 
-Supports:
-  • Authorization Code flow  — end-users authenticate with their own Odoo API key
-    and receive a JWT that encodes their Odoo credentials.  This means every MCP
-    tool call runs under *that user's* Odoo permissions.
-  • Client Credentials flow  — server-to-server use-cases where a single admin
-    account is acceptable (e.g. cron jobs, internal tools).
+Implémente le flow complet attendu par Dust (et tout client MCP 2025-03-26) :
 
-Endpoints
----------
-GET  /.well-known/oauth-authorization-server   RFC 8414 metadata
-GET  /oauth/authorize                          Authorization endpoint
-POST /oauth/token                              Token endpoint
-POST /oauth/revoke                             Token revocation (RFC 7009)
+  1. GET  /.well-known/oauth-protected-resource   RFC 9728  (Dust cherche ici EN PREMIER)
+  2. GET  /.well-known/oauth-authorization-server  RFC 8414
+  3. POST /oauth/register                          RFC 7591 — Dynamic Client Registration
+                                                   (Dust s'auto-enregistre ici)
+  4. GET  /oauth/authorize                         Authorization Code + PKCE
+  5. POST /oauth/token                             Échange code → JWT
+  6. POST /oauth/revoke                            RFC 7009
+
+Flow Dust "Automatic" :
+  Dust → /.well-known/oauth-protected-resource
+       → /.well-known/oauth-authorization-server
+       → POST /oauth/register  (obtient client_id + client_secret)
+       → redirige l'utilisateur vers /oauth/authorize
+       → l'utilisateur saisit ses credentials Odoo
+       → redirect vers Dust avec le code
+       → POST /oauth/token  (échange code + PKCE → JWT avec credentials Odoo)
+       → toutes les requêtes MCP utilisent ce JWT
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -31,16 +38,22 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 
 from .config import settings
 
+
 # ---------------------------------------------------------------------------
-# In-memory stores  (replace with a database for production multi-instance)
+# In-memory stores
 # ---------------------------------------------------------------------------
 
-# code_store[code] = {"client_id": ..., "odoo_username": ..., "odoo_api_key": ...,
-#                      "expires_at": timestamp, "used": bool}
+# Authorization codes
+# code -> {client_id, odoo_username, odoo_api_key, redirect_uri,
+#          code_challenge, code_challenge_method, expires_at, used}
 _code_store: dict[str, dict] = {}
 
-# token_revocation_list: set of jti values that have been revoked
+# Revoked JWT identifiers
 _revoked_jtis: set[str] = set()
+
+# Dynamically registered clients (RFC 7591)
+# client_id -> {client_secret, redirect_uris, registered_at}
+_dynamic_clients: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -57,14 +70,13 @@ def _create_access_token(
 ) -> str:
     now = datetime.now(timezone.utc)
     expire = now + (expires_delta or timedelta(minutes=settings.access_token_expire_minutes))
-    jti = secrets.token_urlsafe(16)
     payload: dict = {
+        "iss": settings.server_url,
         "sub": sub,
         "scope": scope,
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
-        "jti": jti,
-        "iss": settings.server_url,
+        "jti": secrets.token_urlsafe(16),
     }
     if odoo_username:
         payload["odoo_username"] = odoo_username
@@ -74,13 +86,11 @@ def _create_access_token(
 
 
 def verify_token(token: str) -> Optional[dict]:
-    """Decode and validate a JWT.  Returns payload or None."""
     try:
         payload = jwt.decode(
             token,
             settings.jwt_secret_key,
             algorithms=[settings.jwt_algorithm],
-            options={"verify_exp": True},
         )
         if payload.get("jti") in _revoked_jtis:
             return None
@@ -90,94 +100,159 @@ def verify_token(token: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# PKCE helpers (RFC 7636)
+# ---------------------------------------------------------------------------
+
+def _verify_pkce(code_challenge: str, code_challenge_method: str, code_verifier: str) -> bool:
+    if code_challenge_method == "S256":
+        digest = hashlib.sha256(code_verifier.encode()).digest()
+        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return secrets.compare_digest(expected, code_challenge)
+    if code_challenge_method == "plain":
+        return secrets.compare_digest(code_verifier, code_challenge)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Client validation (static + dynamically registered)
+# ---------------------------------------------------------------------------
+
+def _validate_client(client_id: str, client_secret: str) -> bool:
+    """Vérifie les credentials d'un client (statique ou enregistré dynamiquement)."""
+    # Client statique configuré via variables d'environnement
+    if secrets.compare_digest(client_id, settings.oauth_client_id) and \
+       secrets.compare_digest(client_secret, settings.oauth_client_secret):
+        return True
+    # Client enregistré dynamiquement (Dust, etc.)
+    entry = _dynamic_clients.get(client_id)
+    if entry and secrets.compare_digest(client_secret, entry["client_secret"]):
+        return True
+    return False
+
+
+def _client_exists(client_id: str) -> bool:
+    return client_id == settings.oauth_client_id or client_id in _dynamic_clients
+
+
+# ---------------------------------------------------------------------------
 # OAuth 2.0 endpoint handlers
 # ---------------------------------------------------------------------------
 
 async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
-    """RFC 9728 — OAuth 2.0 Protected Resource Metadata.
-    MCP 2025-03-26 clients discover this endpoint FIRST at
-    /.well-known/oauth-protected-resource before falling back to
-    /.well-known/oauth-authorization-server.
-    """
+    """RFC 9728 — Dust appelle cet endpoint EN PREMIER pour découvrir l'auth server."""
     base = settings.server_url
-    return JSONResponse(
-        {
-            "resource": f"{base}/mcp",
-            "authorization_servers": [base],
-            "scopes_supported": ["mcp"],
-            "bearer_methods_supported": ["header"],
-        }
-    )
+    return JSONResponse({
+        "resource": f"{base}/mcp",
+        "authorization_servers": [base],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    })
 
 
 async def oauth_metadata(request: Request) -> JSONResponse:
     """RFC 8414 — Authorization Server Metadata."""
     base = settings.server_url
-    return JSONResponse(
-        {
-            "issuer": base,
-            "authorization_endpoint": f"{base}/oauth/authorize",
-            "token_endpoint": f"{base}/oauth/token",
-            "revocation_endpoint": f"{base}/oauth/revoke",
-            "grant_types_supported": ["authorization_code", "client_credentials"],
-            "response_types_supported": ["code"],
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_post",
-                "client_secret_basic",
-            ],
-            "code_challenge_methods_supported": ["S256"],
-            "scopes_supported": ["mcp"],
-        }
-    )
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "revocation_endpoint": f"{base}/oauth/revoke",
+        "registration_endpoint": f"{base}/oauth/register",
+        "grant_types_supported": ["authorization_code", "client_credentials"],
+        "response_types_supported": ["code"],
+        "token_endpoint_auth_methods_supported": [
+            "client_secret_post",
+            "client_secret_basic",
+            "none",
+        ],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "scopes_supported": ["mcp"],
+        "subject_types_supported": ["public"],
+    })
+
+
+async def oauth_register(request: Request) -> JSONResponse:
+    """RFC 7591 — Dynamic Client Registration.
+    Dust s'enregistre ici automatiquement pour obtenir un client_id/secret.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    client_id = secrets.token_urlsafe(16)
+    client_secret = secrets.token_urlsafe(32)
+
+    _dynamic_clients[client_id] = {
+        "client_secret": client_secret,
+        "redirect_uris": body.get("redirect_uris", []),
+        "registered_at": time.time(),
+    }
+
+    return JSONResponse({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": int(time.time()),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_post",
+        "scope": "mcp",
+    }, status_code=201)
 
 
 async def oauth_authorize(request: Request) -> Response:
-    """Authorization endpoint — shows a login form for the end-user."""
+    """Authorization endpoint — affiche un formulaire de login Odoo à l'utilisateur."""
     params = dict(request.query_params)
     client_id = params.get("client_id", "")
     redirect_uri = params.get("redirect_uri", "")
     state = params.get("state", "")
     response_type = params.get("response_type", "code")
+    code_challenge = params.get("code_challenge", "")
+    code_challenge_method = params.get("code_challenge_method", "S256")
 
-    # Validate client
-    if not secrets.compare_digest(client_id, settings.oauth_client_id):
+    # Validation client
+    if not _client_exists(client_id):
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
     if request.method == "GET":
-        # Show login form
-        html = _login_form_html(client_id, redirect_uri, state)
-        return HTMLResponse(html)
+        return HTMLResponse(_login_form_html(client_id, redirect_uri, state,
+                                             code_challenge, code_challenge_method))
 
-    # POST — process form submission
+    # POST — traitement du formulaire
     form = await request.form()
     odoo_username = str(form.get("odoo_username", "")).strip()
     odoo_api_key = str(form.get("odoo_api_key", "")).strip()
 
     if not odoo_username or not odoo_api_key:
-        html = _login_form_html(
-            client_id, redirect_uri, state, error="Username and API key are required."
+        return HTMLResponse(
+            _login_form_html(client_id, redirect_uri, state,
+                             code_challenge, code_challenge_method,
+                             error="Email et clé API requis."),
+            status_code=400,
         )
-        return HTMLResponse(html, status_code=400)
 
-    # Validate credentials against Odoo
     from .odoo_client import validate_odoo_credentials
-
     if not validate_odoo_credentials(odoo_username, odoo_api_key):
-        html = _login_form_html(
-            client_id, redirect_uri, state, error="Invalid Odoo credentials."
+        return HTMLResponse(
+            _login_form_html(client_id, redirect_uri, state,
+                             code_challenge, code_challenge_method,
+                             error="Credentials Odoo invalides. Vérifiez votre email et votre clé API."),
+            status_code=401,
         )
-        return HTMLResponse(html, status_code=401)
 
-    # Issue authorization code
     code = secrets.token_urlsafe(32)
     _code_store[code] = {
         "client_id": client_id,
         "odoo_username": odoo_username,
         "odoo_api_key": odoo_api_key,
-        "expires_at": time.time() + 300,  # 5 minutes
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at": time.time() + 300,
         "used": False,
     }
 
@@ -186,16 +261,16 @@ async def oauth_authorize(request: Request) -> Response:
 
 
 async def oauth_token(request: Request) -> JSONResponse:
-    """Token endpoint — exchange code or client credentials for a JWT."""
+    """Token endpoint — échange un code ou des credentials contre un JWT."""
     form = await request.form()
     grant_type = str(form.get("grant_type", "")).strip()
 
-    # ── Resolve client credentials ─────────────────────────────────────
+    # Résolution des credentials client
     client_id = str(form.get("client_id", "")).strip()
     client_secret = str(form.get("client_secret", "")).strip()
 
-    # Also support HTTP Basic Auth
-    if not client_id or not client_secret:
+    # Support HTTP Basic Auth
+    if not client_id:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Basic "):
             try:
@@ -204,58 +279,66 @@ async def oauth_token(request: Request) -> JSONResponse:
             except Exception:
                 pass
 
-    if not secrets.compare_digest(client_id or "", settings.oauth_client_id) or not secrets.compare_digest(
-        client_secret or "", settings.oauth_client_secret
-    ):
-        return JSONResponse({"error": "invalid_client"}, status_code=401)
-
-    # ── Authorization Code flow ────────────────────────────────────────
+    # ── Authorization Code flow ────────────────────────────────────────────
     if grant_type == "authorization_code":
         code = str(form.get("code", "")).strip()
+        code_verifier = str(form.get("code_verifier", "")).strip()
         entry = _code_store.get(code)
 
         if not entry:
-            return JSONResponse({"error": "invalid_grant", "error_description": "Unknown code"}, status_code=400)
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "Code inconnu"}, status_code=400)
         if entry["used"]:
-            return JSONResponse({"error": "invalid_grant", "error_description": "Code already used"}, status_code=400)
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "Code déjà utilisé"}, status_code=400)
         if time.time() > entry["expires_at"]:
-            return JSONResponse({"error": "invalid_grant", "error_description": "Code expired"}, status_code=400)
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "Code expiré"}, status_code=400)
         if entry["client_id"] != client_id:
-            return JSONResponse({"error": "invalid_grant", "error_description": "Client mismatch"}, status_code=400)
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "Client mismatch"}, status_code=400)
+
+        # Vérification PKCE si utilisée
+        if entry.get("code_challenge"):
+            if not code_verifier:
+                return JSONResponse({"error": "invalid_grant",
+                                     "error_description": "code_verifier manquant"}, status_code=400)
+            if not _verify_pkce(entry["code_challenge"], entry["code_challenge_method"], code_verifier):
+                return JSONResponse({"error": "invalid_grant",
+                                     "error_description": "PKCE invalide"}, status_code=400)
+
+        # Validation client (optionnelle pour les clients publics PKCE)
+        if client_secret and not _validate_client(client_id, client_secret):
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         entry["used"] = True
-
         token = _create_access_token(
             sub=entry["odoo_username"],
-            scope="mcp",
             odoo_username=entry["odoo_username"],
             odoo_api_key=entry["odoo_api_key"],
         )
-        return JSONResponse(
-            {
-                "access_token": token,
-                "token_type": "bearer",
-                "expires_in": settings.access_token_expire_minutes * 60,
-                "scope": "mcp",
-            }
-        )
+        return JSONResponse({
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": settings.access_token_expire_minutes * 60,
+            "scope": "mcp",
+        })
 
-    # ── Client Credentials flow (admin / service account) ─────────────
+    # ── Client Credentials flow ────────────────────────────────────────────
     if grant_type == "client_credentials":
+        if not _validate_client(client_id, client_secret):
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
         token = _create_access_token(
             sub=client_id,
-            scope="mcp",
             odoo_username=settings.odoo_admin_username,
             odoo_api_key=settings.odoo_admin_api_key,
         )
-        return JSONResponse(
-            {
-                "access_token": token,
-                "token_type": "bearer",
-                "expires_in": settings.access_token_expire_minutes * 60,
-                "scope": "mcp",
-            }
-        )
+        return JSONResponse({
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": settings.access_token_expire_minutes * 60,
+            "scope": "mcp",
+        })
 
     return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
@@ -274,41 +357,35 @@ async def oauth_revoke(request: Request) -> Response:
 # Bearer token middleware
 # ---------------------------------------------------------------------------
 
-_OPEN_PATHS = frozenset(
-    [
-        "/.well-known/oauth-authorization-server",
-        "/.well-known/oauth-protected-resource",
-        "/mcp/.well-known/oauth-authorization-server",
-        "/mcp/.well-known/oauth-protected-resource",
-        "/oauth/token",
-        "/oauth/authorize",
-        "/oauth/revoke",
-        "/health",
-        "/",
-    ]
-)
+_OPEN_PATHS = frozenset([
+    "/",
+    "/health",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-authorization-server",
+    "/mcp/.well-known/oauth-protected-resource",
+    "/mcp/.well-known/oauth-authorization-server",
+    "/oauth/register",
+    "/oauth/authorize",
+    "/oauth/token",
+    "/oauth/revoke",
+])
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
-    """Validate Bearer JWT on all paths except the OAuth + health endpoints."""
-
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
         if request.url.path in _OPEN_PATHS:
             return await call_next(request)
 
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
+            # WWW-Authenticate avec resource_metadata pour la découverte primaire
             return JSONResponse(
-                {
-                    "error": "unauthorized",
-                    "error_description": "A Bearer token is required.",
-                },
+                {"error": "unauthorized", "error_description": "Bearer token requis."},
                 status_code=401,
                 headers={
                     "WWW-Authenticate": (
                         f'Bearer realm="{settings.server_url}", '
-                        'scope="mcp", '
-                        f'error="unauthorized"'
+                        f'resource_metadata="{settings.server_url}/.well-known/oauth-protected-resource"'
                     )
                 },
             )
@@ -316,69 +393,82 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         payload = verify_token(auth[7:])
         if payload is None:
             return JSONResponse(
-                {
-                    "error": "invalid_token",
-                    "error_description": "Token is invalid or has expired.",
-                },
+                {"error": "invalid_token", "error_description": "Token invalide ou expiré."},
                 status_code=401,
                 headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             )
 
-        # Attach user context so tools can pick up per-user Odoo credentials
         request.state.odoo_username = payload.get("odoo_username")
         request.state.odoo_api_key = payload.get("odoo_api_key")
         request.state.token_sub = payload.get("sub")
-
         return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
-# Login form HTML (minimal, customize to match your brand)
+# Login form HTML
 # ---------------------------------------------------------------------------
 
 def _login_form_html(
     client_id: str,
     redirect_uri: str,
     state: str,
+    code_challenge: str = "",
+    code_challenge_method: str = "S256",
     error: Optional[str] = None,
 ) -> str:
     error_html = f'<p class="error">{error}</p>' if error else ""
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign in — Odoo MCP</title>
+  <title>Connexion Odoo — MCP</title>
   <style>
-    body {{ font-family: system-ui, sans-serif; background: #f5f5f5;
-            display: flex; align-items: center; justify-content: center; min-height: 100vh; margin:0; }}
-    .card {{ background: white; padding: 2rem; border-radius: 8px; width: 360px;
-             box-shadow: 0 2px 12px rgba(0,0,0,.1); }}
-    h1 {{ margin: 0 0 1.5rem; font-size: 1.25rem; }}
-    label {{ display: block; font-size: .875rem; margin-bottom: .25rem; color: #555; }}
-    input {{ width: 100%; box-sizing: border-box; padding: .5rem .75rem;
-             border: 1px solid #ddd; border-radius: 4px; font-size: 1rem; margin-bottom: 1rem; }}
-    button {{ width: 100%; padding: .6rem; background: #714B67; color: white;
-              border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: system-ui, -apple-system, sans-serif; background: #f0f2f5;
+            display: flex; align-items: center; justify-content: center;
+            min-height: 100vh; }}
+    .card {{ background: white; padding: 2.5rem; border-radius: 12px; width: 380px;
+             box-shadow: 0 4px 24px rgba(0,0,0,.08); }}
+    .logo {{ font-size: 2rem; margin-bottom: 0.5rem; }}
+    h1 {{ font-size: 1.25rem; margin-bottom: 0.25rem; color: #1a1a1a; }}
+    .subtitle {{ font-size: .875rem; color: #666; margin-bottom: 1.5rem; }}
+    label {{ display: block; font-size: .875rem; font-weight: 500;
+             margin-bottom: .375rem; color: #374151; }}
+    input {{ width: 100%; padding: .625rem .875rem; border: 1.5px solid #d1d5db;
+             border-radius: 6px; font-size: 1rem; margin-bottom: 1rem;
+             transition: border-color .15s; outline: none; }}
+    input:focus {{ border-color: #714B67; }}
+    .hint {{ font-size: .75rem; color: #9ca3af; margin-top: -.75rem;
+             margin-bottom: 1rem; }}
+    button {{ width: 100%; padding: .75rem; background: #714B67; color: white;
+              border: none; border-radius: 6px; font-size: 1rem; font-weight: 600;
+              cursor: pointer; transition: background .15s; }}
     button:hover {{ background: #5d3d56; }}
-    .error {{ color: #c0392b; font-size: .875rem; margin-bottom: 1rem; }}
+    .error {{ color: #dc2626; font-size: .875rem; margin-bottom: 1rem;
+              padding: .625rem; background: #fef2f2; border-radius: 6px; }}
   </style>
 </head>
 <body>
 <div class="card">
-  <h1>🔗 Connect your Odoo account</h1>
+  <div class="logo">🔗</div>
+  <h1>Connecter votre compte Odoo</h1>
+  <p class="subtitle">Autorisez l'accès à votre instance Odoo</p>
   {error_html}
   <form method="POST">
     <input type="hidden" name="client_id" value="{client_id}">
     <input type="hidden" name="redirect_uri" value="{redirect_uri}">
     <input type="hidden" name="state" value="{state}">
-    <label for="odoo_username">Odoo email</label>
+    <input type="hidden" name="code_challenge" value="{code_challenge}">
+    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
+    <label for="odoo_username">Email Odoo</label>
     <input id="odoo_username" name="odoo_username" type="email"
-           placeholder="you@company.com" required autocomplete="username">
-    <label for="odoo_api_key">Odoo API key</label>
+           placeholder="vous@societe.com" required autocomplete="username">
+    <label for="odoo_api_key">Clé API Odoo</label>
     <input id="odoo_api_key" name="odoo_api_key" type="password"
-           placeholder="Your Odoo API key" required autocomplete="current-password">
-    <button type="submit">Authorize</button>
+           placeholder="Votre clé API" required autocomplete="current-password">
+    <p class="hint">Générez une clé API dans Odoo → Paramètres → Clés API</p>
+    <button type="submit">Autoriser l'accès</button>
   </form>
 </div>
 </body>

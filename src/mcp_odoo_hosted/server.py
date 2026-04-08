@@ -1,18 +1,16 @@
 """
-MCP Odoo Hosted — main server.
+MCP Odoo Hosted — serveur principal
 
-Architecture
-------------
-  POST /mcp              Streamable HTTP MCP endpoint (MCP 2025-03-26)
-  GET  /.well-known/…    OAuth 2.0 Authorization Server metadata
-  GET  /oauth/authorize  Authorization Code login page
-  POST /oauth/token      Token endpoint (auth_code + client_credentials)
-  POST /oauth/revoke     Token revocation
-  GET  /health           Health-check
-
-Every request to /mcp must carry a valid Bearer JWT.
-The JWT encodes the user's Odoo credentials so each tool call runs
-under *that user's* Odoo access rights.
+Endpoints
+---------
+  GET  /.well-known/oauth-protected-resource    RFC 9728 (Dust cherche ici EN PREMIER)
+  GET  /.well-known/oauth-authorization-server  RFC 8414
+  POST /oauth/register                          RFC 7591 — Dynamic Client Registration
+  GET  /oauth/authorize                         Authorization Code + PKCE
+  POST /oauth/token                             Échange code → JWT
+  POST /oauth/revoke                            RFC 7009
+  GET  /health                                  Health-check
+  POST /mcp                                     Streamable HTTP MCP (MCP 2025-03-26)
 """
 from __future__ import annotations
 
@@ -31,11 +29,13 @@ from .auth import (
     oauth_authorize,
     oauth_metadata,
     oauth_protected_resource_metadata,
+    oauth_register,
     oauth_revoke,
     oauth_token,
 )
 from .config import settings
-from .odoo_client import get_client_for_request
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # FastMCP instance
@@ -48,22 +48,22 @@ mcp = FastMCP(
         "You can manage timesheets, expenses, contacts, invoices, sales orders, "
         "products, and HR records on behalf of the authenticated user."
     ),
-    stateless_http=True,  # Required for hosted/stateless deployment
+    stateless_http=True,
 )
 
 # ---------------------------------------------------------------------------
-# Register tools from all modules
+# Enregistrement des outils
 # ---------------------------------------------------------------------------
 
-from .tools.contacts import register as _reg_contacts  # noqa: E402
-from .tools.expenses import register as _reg_expenses  # noqa: E402
-from .tools.hr import register as _reg_hr  # noqa: E402
-from .tools.invoices import register as _reg_invoices  # noqa: E402
-from .tools.products import register as _reg_products  # noqa: E402
-from .tools.projects import register as _reg_projects  # noqa: E402
-from .tools.sales import register as _reg_sales  # noqa: E402
-from .tools.timesheets import register as _reg_timesheets  # noqa: E402
-from .tools.utilities import register as _reg_utilities  # noqa: E402
+from .tools.contacts import register as _reg_contacts
+from .tools.expenses import register as _reg_expenses
+from .tools.hr import register as _reg_hr
+from .tools.invoices import register as _reg_invoices
+from .tools.products import register as _reg_products
+from .tools.projects import register as _reg_projects
+from .tools.sales import register as _reg_sales
+from .tools.timesheets import register as _reg_timesheets
+from .tools.utilities import register as _reg_utilities
 
 _reg_contacts(mcp)
 _reg_expenses(mcp)
@@ -76,7 +76,7 @@ _reg_timesheets(mcp)
 _reg_utilities(mcp)
 
 # ---------------------------------------------------------------------------
-# Health check
+# Endpoints utilitaires
 # ---------------------------------------------------------------------------
 
 async def health(request: Request) -> JSONResponse:
@@ -85,17 +85,16 @@ async def health(request: Request) -> JSONResponse:
 
 async def root(request: Request) -> JSONResponse:
     base = settings.server_url
-    return JSONResponse(
-        {
-            "name": "mcp-odoo-hosted",
-            "mcp_endpoint": f"{base}/mcp",
-            "auth_metadata": f"{base}/.well-known/oauth-authorization-server",
-        }
-    )
+    return JSONResponse({
+        "name": "mcp-odoo-hosted",
+        "mcp_endpoint": f"{base}/mcp",
+        "oauth_metadata": f"{base}/.well-known/oauth-authorization-server",
+        "protected_resource": f"{base}/.well-known/oauth-protected-resource",
+    })
 
 
 # ---------------------------------------------------------------------------
-# Build the combined ASGI application
+# Construction de l'application ASGI
 # ---------------------------------------------------------------------------
 
 def create_app() -> Starlette:
@@ -104,25 +103,35 @@ def create_app() -> Starlette:
     routes = [
         Route("/", root),
         Route("/health", health),
-        # RFC 9728 — Protected Resource Metadata (MCP clients check this FIRST)
-        # Exposed at root AND under /mcp/ because some clients derive the path
-        # from the MCP endpoint URL (e.g. https://host/mcp → looks at /mcp/.well-known/…)
-        Route("/.well-known/oauth-protected-resource", oauth_protected_resource_metadata, methods=["GET"]),
-        Route("/mcp/.well-known/oauth-protected-resource", oauth_protected_resource_metadata, methods=["GET"]),
-        # RFC 8414 — Authorization Server Metadata
-        Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
-        Route("/mcp/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+
+        # RFC 9728 — exposé à la racine ET sous /mcp/ (certains clients dérivent
+        # le chemin depuis l'URL du endpoint MCP)
+        Route("/.well-known/oauth-protected-resource",
+              oauth_protected_resource_metadata, methods=["GET"]),
+        Route("/mcp/.well-known/oauth-protected-resource",
+              oauth_protected_resource_metadata, methods=["GET"]),
+
+        # RFC 8414
+        Route("/.well-known/oauth-authorization-server",
+              oauth_metadata, methods=["GET"]),
+        Route("/mcp/.well-known/oauth-authorization-server",
+              oauth_metadata, methods=["GET"]),
+
+        # OAuth endpoints
+        Route("/oauth/register", oauth_register, methods=["POST"]),
         Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         Route("/oauth/revoke", oauth_revoke, methods=["POST"]),
+
+        # MCP endpoint (Streamable HTTP)
         Mount("/mcp", app=mcp_asgi),
     ]
 
     middleware = [
-        # CORS must be first so preflight OPTIONS requests are handled before auth
+        # CORS en premier pour que les preflight OPTIONS passent avant l'auth
         Middleware(
             CORSMiddleware,
-            allow_origins=["*"],        # Restrict to your domain(s) in production
+            allow_origins=["*"],
             allow_methods=["*"],
             allow_headers=["*"],
             expose_headers=["*"],
@@ -130,7 +139,20 @@ def create_app() -> Starlette:
         Middleware(BearerTokenMiddleware),
     ]
 
-    return Starlette(routes=routes, middleware=middleware)
+    app = Starlette(routes=routes, middleware=middleware)
+
+    @app.on_event("startup")
+    async def on_startup() -> None:
+        logger.info("=" * 50)
+        logger.info("MCP Odoo Hosted — démarrage")
+        logger.info("Endpoint MCP   : %s/mcp", settings.server_url)
+        logger.info("OAuth metadata : %s/.well-known/oauth-authorization-server",
+                    settings.server_url)
+        logger.info("Client ID      : %s", settings.oauth_client_id)
+        logger.info("Client Secret  : %s", settings.oauth_client_secret)
+        logger.info("=" * 50)
+
+    return app
 
 
 app = create_app()
