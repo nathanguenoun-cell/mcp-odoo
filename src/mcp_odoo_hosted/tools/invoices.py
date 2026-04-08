@@ -26,8 +26,6 @@ def register(mcp: FastMCP) -> None:
         payment_state: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List invoices.
@@ -53,7 +51,7 @@ def register(mcp: FastMCP) -> None:
         if payment_state:
             domain.append(["payment_state", "=", payment_state])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "account.move",
             domain=domain,
@@ -68,13 +66,9 @@ def register(mcp: FastMCP) -> None:
         return records
 
     @mcp.tool()
-    def get_invoice(
-        invoice_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def get_invoice(invoice_id: int) -> dict:
         """Return full details of an invoice including its lines."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.read("account.move", [invoice_id], fields=_FIELDS)
         if not records:
             return {"error": f"Invoice {invoice_id} not found"}

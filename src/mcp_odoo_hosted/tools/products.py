@@ -25,8 +25,6 @@ def register(mcp: FastMCP) -> None:
         product_type: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List products.
@@ -44,7 +42,7 @@ def register(mcp: FastMCP) -> None:
         if product_type:
             domain.append(["type", "=", product_type])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "product.product",
             domain=domain,
@@ -58,13 +56,9 @@ def register(mcp: FastMCP) -> None:
         return records
 
     @mcp.tool()
-    def get_product(
-        product_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
-    ) -> dict:
+    def get_product(product_id: int) -> dict:
         """Return full details of a product variant."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.read("product.product", [product_id], fields=_PROD_FIELDS)
         if not records:
             return {"error": f"Product {product_id} not found"}

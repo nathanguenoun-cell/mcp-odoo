@@ -22,8 +22,6 @@ def register(mcp: FastMCP) -> None:
         is_company: Optional[bool] = None,
         limit: int = 50,
         offset: int = 0,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List contacts / partners.
@@ -42,7 +40,7 @@ def register(mcp: FastMCP) -> None:
         if is_company is not None:
             domain.append(["is_company", "=", is_company])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "res.partner", domain=domain, fields=_FIELDS, limit=limit, offset=offset, order="name asc"
         )
@@ -55,11 +53,9 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool()
     def get_contact(
         contact_id: int,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """Return full details for a contact by ID."""
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.read("res.partner", [contact_id], fields=_FIELDS)
         if not records:
             return {"error": f"Contact {contact_id} not found"}
@@ -80,8 +76,6 @@ def register(mcp: FastMCP) -> None:
         zip_code: Optional[str] = None,
         country_id: Optional[int] = None,
         comment: Optional[str] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """Create a new contact / partner."""
         values: dict = {"name": name, "is_company": is_company}
@@ -102,7 +96,7 @@ def register(mcp: FastMCP) -> None:
         if comment:
             values["comment"] = comment
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         new_id = client.create("res.partner", values)
         return {"id": new_id, "name": name}
 
@@ -118,8 +112,6 @@ def register(mcp: FastMCP) -> None:
         zip_code: Optional[str] = None,
         country_id: Optional[int] = None,
         comment: Optional[str] = None,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> dict:
         """Update an existing contact."""
         values: dict = {}
@@ -145,6 +137,6 @@ def register(mcp: FastMCP) -> None:
         if not values:
             return {"error": "No fields to update"}
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         client.write("res.partner", [contact_id], values)
         return {"id": contact_id, "updated": list(values.keys())}

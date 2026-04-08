@@ -37,6 +37,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .config import settings
+from .context import odoo_api_key_var, odoo_username_var
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +398,13 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 status_code=401,
                 headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             )
+
+        # Inject credentials into the async context so FastMCP tool handlers
+        # can access them via odoo_username_var / odoo_api_key_var.
+        # Starlette's BaseHTTPMiddleware calls copy_context() inside call_next,
+        # so values set here are inherited by the inner app task.
+        odoo_username_var.set(payload.get("odoo_username"))
+        odoo_api_key_var.set(payload.get("odoo_api_key"))
 
         request.state.odoo_username = payload.get("odoo_username")
         request.state.odoo_api_key = payload.get("odoo_api_key")

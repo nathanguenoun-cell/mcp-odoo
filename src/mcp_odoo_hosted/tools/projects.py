@@ -13,14 +13,12 @@ def register(mcp: FastMCP) -> None:
     def list_projects(
         search: Optional[str] = None,
         limit: int = 50,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """List projects the user has access to."""
         domain: list = []
         if search:
             domain.append(["name", "ilike", search])
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         return client.search_read(
             "project.project",
             domain=domain,
@@ -36,8 +34,6 @@ def register(mcp: FastMCP) -> None:
         search: Optional[str] = None,
         stage: Optional[str] = None,
         limit: int = 50,
-        odoo_username: Optional[str] = None,
-        odoo_api_key: Optional[str] = None,
     ) -> list:
         """
         List tasks, optionally filtered by project, assignee, or name search.
@@ -59,7 +55,7 @@ def register(mcp: FastMCP) -> None:
         if stage:
             domain.append(["stage_id.name", "ilike", stage])
 
-        client = user_client(odoo_username, odoo_api_key)
+        client = user_client()
         records = client.search_read(
             "project.task",
             domain=domain,
