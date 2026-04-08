@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import secrets
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
@@ -58,15 +57,15 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def derive_oauth_secret(self) -> "Settings":
         """
-        If OAUTH_CLIENT_SECRET is not set as an env var, derive it
-        deterministically from jwt_secret_key so it stays stable across
-        restarts (as long as JWT_SECRET_KEY is fixed in Railway).
+        Si oauth_client_secret est vide (variable non définie dans Railway),
+        le dériver de jwt_secret_key de façon déterministe.
+        On vérifie self.oauth_client_secret (lu par pydantic-settings)
+        plutôt que os.environ pour éviter les problèmes de casse.
         """
-        if not os.environ.get("OAUTH_CLIENT_SECRET"):
-            derived = hashlib.sha256(
+        if not self.oauth_client_secret:
+            self.oauth_client_secret = hashlib.sha256(
                 f"oauth_client_secret:{self.jwt_secret_key}".encode()
             ).hexdigest()
-            self.oauth_client_secret = derived
         return self
 
     model_config = {"env_file": ".env", "case_sensitive": False, "extra": "ignore"}
