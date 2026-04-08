@@ -93,6 +93,23 @@ def verify_token(token: str) -> Optional[dict]:
 # OAuth 2.0 endpoint handlers
 # ---------------------------------------------------------------------------
 
+async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
+    """RFC 9728 — OAuth 2.0 Protected Resource Metadata.
+    MCP 2025-03-26 clients discover this endpoint FIRST at
+    /.well-known/oauth-protected-resource before falling back to
+    /.well-known/oauth-authorization-server.
+    """
+    base = settings.server_url
+    return JSONResponse(
+        {
+            "resource": f"{base}/mcp",
+            "authorization_servers": [base],
+            "scopes_supported": ["mcp"],
+            "bearer_methods_supported": ["header"],
+        }
+    )
+
+
 async def oauth_metadata(request: Request) -> JSONResponse:
     """RFC 8414 — Authorization Server Metadata."""
     base = settings.server_url
@@ -260,6 +277,7 @@ async def oauth_revoke(request: Request) -> Response:
 _OPEN_PATHS = frozenset(
     [
         "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
         "/oauth/token",
         "/oauth/authorize",
         "/oauth/revoke",

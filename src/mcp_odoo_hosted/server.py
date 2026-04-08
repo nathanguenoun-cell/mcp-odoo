@@ -29,6 +29,7 @@ from .auth import (
     BearerTokenMiddleware,
     oauth_authorize,
     oauth_metadata,
+    oauth_protected_resource_metadata,
     oauth_revoke,
     oauth_token,
 )
@@ -102,6 +103,9 @@ def create_app() -> Starlette:
     routes = [
         Route("/", root),
         Route("/health", health),
+        # RFC 9728 — Protected Resource Metadata (MCP clients check this FIRST)
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource_metadata, methods=["GET"]),
+        # RFC 8414 — Authorization Server Metadata
         Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
         Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
