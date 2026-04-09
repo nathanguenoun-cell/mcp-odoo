@@ -183,6 +183,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "authorization_endpoint": f"{base}/oauth/authorize",
         "token_endpoint": f"{base}/oauth/token",
         "revocation_endpoint": f"{base}/oauth/revoke",
+        "registration_endpoint": f"{base}/oauth/register",
         "grant_types_supported": ["authorization_code"],
         "response_types_supported": ["code"],
         "token_endpoint_auth_methods_supported": [
