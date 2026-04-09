@@ -20,17 +20,25 @@ Flow Dust "Automatic" :
        → redirect vers Dust avec le code
        → POST /oauth/token  (échange code + PKCE → JWT avec credentials Odoo)
        → toutes les requêtes MCP utilisent ce JWT
+
+Persistence :
+  Quand REDIS_ENABLED=true, les clients enregistrés et les codes d'autorisation
+  sont stockés dans Redis et survivent aux redémarrages du serveur.
+  Sinon, stockage en mémoire (perdu au redémarrage).
 """
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import logging
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
+import redis.asyncio as aioredis
 from jose import JWTError, jwt
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -38,6 +46,8 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 
 from .config import settings
 from .context import odoo_api_key_var, odoo_username_var
+
+logger = logging.getLogger(__name__)
 
 
 def _base_url(request: Request) -> str:
@@ -52,20 +62,122 @@ def _base_url(request: Request) -> str:
 
 
 # ---------------------------------------------------------------------------
-# In-memory stores
+# Redis client (lazy init)
 # ---------------------------------------------------------------------------
 
-# Authorization codes
-# code -> {client_id, odoo_username, odoo_api_key, redirect_uri,
-#          code_challenge, code_challenge_method, expires_at, used}
-_code_store: dict[str, dict] = {}
+_redis_client: Optional[aioredis.Redis] = None
 
-# Revoked JWT identifiers
-_revoked_jtis: set[str] = set()
+_KEY_CLIENT = "mcp:oauth:client:"   # mcp:oauth:client:{client_id} → JSON
+_KEY_CODE = "mcp:oauth:code:"       # mcp:oauth:code:{code} → JSON, TTL 300s
+_KEY_REVOKED = "mcp:oauth:revoked"  # Redis Set of revoked JTIs
 
-# Dynamically registered clients (RFC 7591)
-# client_id -> {client_secret, redirect_uris, registered_at}
-_dynamic_clients: dict[str, dict] = {}
+_CODE_TTL = 300  # seconds
+
+
+def _get_redis() -> Optional[aioredis.Redis]:
+    global _redis_client
+    if not settings.redis_enabled:
+        return None
+    if _redis_client is None:
+        _redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    return _redis_client
+
+
+# ---------------------------------------------------------------------------
+# In-memory fallback stores (used when Redis is disabled)
+# ---------------------------------------------------------------------------
+
+_clients_mem: dict[str, dict] = {}
+_codes_mem: dict[str, dict] = {}
+_revoked_jtis_mem: set[str] = set()  # also used as local cache when Redis is on
+
+
+# ---------------------------------------------------------------------------
+# Store helpers — async, Redis-backed with in-memory fallback
+# ---------------------------------------------------------------------------
+
+async def _store_client(client_id: str, data: dict) -> None:
+    r = _get_redis()
+    if r:
+        try:
+            await r.set(_KEY_CLIENT + client_id, json.dumps(data))
+            return
+        except Exception:
+            logger.exception("Redis error storing client %s, falling back to memory", client_id)
+    _clients_mem[client_id] = data
+
+
+async def _get_client(client_id: str) -> Optional[dict]:
+    r = _get_redis()
+    if r:
+        try:
+            raw = await r.get(_KEY_CLIENT + client_id)
+            return json.loads(raw) if raw else None
+        except Exception:
+            logger.exception("Redis error fetching client %s, falling back to memory", client_id)
+    return _clients_mem.get(client_id)
+
+
+async def _store_code(code: str, data: dict) -> None:
+    r = _get_redis()
+    if r:
+        try:
+            await r.setex(_KEY_CODE + code, _CODE_TTL, json.dumps(data))
+            return
+        except Exception:
+            logger.exception("Redis error storing code, falling back to memory")
+    _codes_mem[code] = data
+
+
+async def _get_code(code: str) -> Optional[dict]:
+    r = _get_redis()
+    if r:
+        try:
+            raw = await r.get(_KEY_CODE + code)
+            return json.loads(raw) if raw else None
+        except Exception:
+            logger.exception("Redis error fetching code, falling back to memory")
+    return _codes_mem.get(code)
+
+
+async def _update_code(code: str, data: dict) -> None:
+    """Persist updated code entry (e.g. after marking as used)."""
+    r = _get_redis()
+    if r:
+        try:
+            key = _KEY_CODE + code
+            ttl = await r.ttl(key)
+            remaining = max(ttl, 10) if ttl and ttl > 0 else 10
+            await r.setex(key, remaining, json.dumps(data))
+            return
+        except Exception:
+            logger.exception("Redis error updating code, falling back to memory")
+    _codes_mem[code] = data
+
+
+async def _revoke_jti(jti: str) -> None:
+    _revoked_jtis_mem.add(jti)
+    r = _get_redis()
+    if r:
+        try:
+            await r.sadd(_KEY_REVOKED, jti)
+        except Exception:
+            logger.exception("Redis error revoking JTI")
+
+
+async def _is_jti_revoked(jti: str) -> bool:
+    if jti in _revoked_jtis_mem:
+        return True
+    r = _get_redis()
+    if r:
+        try:
+            result = await r.sismember(_KEY_REVOKED, jti)
+            if result:
+                _revoked_jtis_mem.add(jti)  # cache locally
+            return bool(result)
+        except Exception:
+            logger.exception("Redis error checking JTI revocation")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -97,18 +209,37 @@ def _create_access_token(
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
-def verify_token(token: str) -> Optional[dict]:
+def _decode_token(token: str) -> Optional[dict]:
+    """Decode and validate token signature/expiry. Does NOT check revocation."""
     try:
-        payload = jwt.decode(
+        return jwt.decode(
             token,
             settings.jwt_secret_key,
             algorithms=[settings.jwt_algorithm],
         )
-        if payload.get("jti") in _revoked_jtis:
-            return None
-        return payload
     except JWTError:
         return None
+
+
+async def verify_token_async(token: str) -> Optional[dict]:
+    payload = _decode_token(token)
+    if payload is None:
+        return None
+    jti = payload.get("jti")
+    if jti and await _is_jti_revoked(jti):
+        return None
+    return payload
+
+
+# Keep a sync version for backward compatibility (skips Redis revocation check,
+# relies on local cache populated by previous async calls).
+def verify_token(token: str) -> Optional[dict]:
+    payload = _decode_token(token)
+    if payload is None:
+        return None
+    if payload.get("jti") in _revoked_jtis_mem:
+        return None
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -129,17 +260,16 @@ def _verify_pkce(code_challenge: str, code_challenge_method: str, code_verifier:
 # Client validation (static + dynamically registered)
 # ---------------------------------------------------------------------------
 
-def _validate_client(client_id: str, client_secret: str) -> bool:
+async def _validate_client_async(client_id: str, client_secret: str) -> bool:
     """Vérifie les credentials d'un client (statique ou enregistré dynamiquement)."""
     # Client statique configuré via variables d'environnement
     if secrets.compare_digest(client_id, settings.oauth_client_id) and \
        secrets.compare_digest(client_secret, settings.oauth_client_secret):
         return True
     # Client enregistré dynamiquement (Dust, etc.)
-    entry = _dynamic_clients.get(client_id)
+    entry = await _get_client(client_id)
     if entry:
         if entry.get("public"):
-            # Public client — no secret to validate; accept as long as client_id matches
             return True
         stored_secret = entry.get("client_secret") or ""
         if stored_secret and secrets.compare_digest(client_secret, stored_secret):
@@ -153,10 +283,7 @@ def _is_url_client_id(client_id: str) -> bool:
 
 
 def _client_exists(client_id: str) -> bool:
-    # Accept any non-empty client_id: since we don't advertise a
-    # registration_endpoint, clients bring their own pre-configured client_id.
-    # Dust uses token_endpoint_auth_method="none" (public client, no secret),
-    # so we cannot validate the client by secret anyway.
+    # Accept any non-empty client_id at the authorize step.
     return bool(client_id)
 
 
@@ -198,14 +325,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
 
 
 async def oauth_register(request: Request) -> JSONResponse:
-    """RFC 7591 — Dynamic Client Registration.
-
-    Handles both confidential clients (with client_secret) and public clients
-    (token_endpoint_auth_method=none, no secret). Dust registers as a public
-    client, so we return no secret in that case — this lets Dust store just the
-    client_id, which MCPOAuthProvider.clientInformation() returns successfully
-    on subsequent calls, bypassing the saveClientInformation requirement.
-    """
+    """RFC 7591 — Dynamic Client Registration."""
     try:
         body = await request.json()
     except Exception:
@@ -227,22 +347,20 @@ async def oauth_register(request: Request) -> JSONResponse:
     }
 
     if is_public:
-        # Public client — no secret issued (RFC 7591 §2, §3.2.1)
-        _dynamic_clients[client_id] = {
+        await _store_client(client_id, {
             "client_secret": None,
             "redirect_uris": body.get("redirect_uris", []),
             "registered_at": time.time(),
             "public": True,
-        }
+        })
     else:
-        # Confidential client — issue a secret
         client_secret = secrets.token_urlsafe(32)
-        _dynamic_clients[client_id] = {
+        await _store_client(client_id, {
             "client_secret": client_secret,
             "redirect_uris": body.get("redirect_uris", []),
             "registered_at": time.time(),
             "public": False,
-        }
+        })
         response_body["client_secret"] = client_secret
         response_body["client_secret_expires_at"] = 0  # 0 = never expires (RFC 7591 §3.2.1)
 
@@ -259,7 +377,6 @@ async def oauth_authorize(request: Request) -> Response:
     code_challenge = params.get("code_challenge", "")
     code_challenge_method = params.get("code_challenge_method", "S256")
 
-    # Validation client
     if not _client_exists(client_id):
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
@@ -293,16 +410,16 @@ async def oauth_authorize(request: Request) -> Response:
         )
 
     code = secrets.token_urlsafe(32)
-    _code_store[code] = {
+    await _store_code(code, {
         "client_id": client_id,
         "odoo_username": odoo_username,
         "odoo_api_key": odoo_api_key,
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
-        "expires_at": time.time() + 300,
+        "expires_at": time.time() + _CODE_TTL,
         "used": False,
-    }
+    })
 
     qs = urlencode({"code": code, "state": state})
     return RedirectResponse(f"{redirect_uri}?{qs}", status_code=302)
@@ -331,7 +448,7 @@ async def oauth_token(request: Request) -> JSONResponse:
     if grant_type == "authorization_code":
         code = str(form.get("code", "")).strip()
         code_verifier = str(form.get("code_verifier", "")).strip()
-        entry = _code_store.get(code)
+        entry = await _get_code(code)
 
         if not entry:
             return JSONResponse({"error": "invalid_grant",
@@ -356,11 +473,13 @@ async def oauth_token(request: Request) -> JSONResponse:
                                      "error_description": "PKCE invalide"}, status_code=400)
 
         # Validate client secret when present; skip for URL-based client IDs (SEP-991)
-        # which are public clients with no secret.
-        if client_secret and not _is_url_client_id(client_id) and not _validate_client(client_id, client_secret):
+        if client_secret and not _is_url_client_id(client_id) and \
+                not await _validate_client_async(client_id, client_secret):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         entry["used"] = True
+        await _update_code(code, entry)
+
         token = _create_access_token(
             sub=entry["odoo_username"],
             odoo_username=entry["odoo_username"],
@@ -375,7 +494,7 @@ async def oauth_token(request: Request) -> JSONResponse:
 
     # ── Client Credentials flow ────────────────────────────────────────────
     if grant_type == "client_credentials":
-        if not _validate_client(client_id, client_secret):
+        if not await _validate_client_async(client_id, client_secret):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
         token = _create_access_token(
             sub=client_id,
@@ -396,9 +515,9 @@ async def oauth_revoke(request: Request) -> Response:
     """RFC 7009 — Token Revocation."""
     form = await request.form()
     token = str(form.get("token", "")).strip()
-    payload = verify_token(token)
+    payload = _decode_token(token)
     if payload and payload.get("jti"):
-        _revoked_jtis.add(payload["jti"])
+        await _revoke_jti(payload["jti"])
     return Response(status_code=200)
 
 
@@ -427,7 +546,6 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
 
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            # WWW-Authenticate avec resource_metadata pour la découverte primaire
             base = _base_url(request)
             return JSONResponse(
                 {"error": "unauthorized", "error_description": "Bearer token requis."},
@@ -440,7 +558,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-        payload = verify_token(auth[7:])
+        payload = await verify_token_async(auth[7:])
         if payload is None:
             return JSONResponse(
                 {"error": "invalid_token", "error_description": "Token invalide ou expiré."},
@@ -448,10 +566,6 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             )
 
-        # Inject credentials into the async context so FastMCP tool handlers
-        # can access them via odoo_username_var / odoo_api_key_var.
-        # Starlette's BaseHTTPMiddleware calls copy_context() inside call_next,
-        # so values set here are inherited by the inner app task.
         odoo_username_var.set(payload.get("odoo_username"))
         odoo_api_key_var.set(payload.get("odoo_api_key"))
 
