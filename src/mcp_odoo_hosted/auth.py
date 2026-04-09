@@ -137,8 +137,13 @@ def _validate_client(client_id: str, client_secret: str) -> bool:
         return True
     # Client enregistré dynamiquement (Dust, etc.)
     entry = _dynamic_clients.get(client_id)
-    if entry and secrets.compare_digest(client_secret, entry["client_secret"]):
-        return True
+    if entry:
+        if entry.get("public"):
+            # Public client — no secret to validate; accept as long as client_id matches
+            return True
+        stored_secret = entry.get("client_secret") or ""
+        if stored_secret and secrets.compare_digest(client_secret, stored_secret):
+            return True
     return False
 
 
@@ -178,14 +183,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "authorization_endpoint": f"{base}/oauth/authorize",
         "token_endpoint": f"{base}/oauth/token",
         "revocation_endpoint": f"{base}/oauth/revoke",
-        # NOTE: registration_endpoint is intentionally omitted.
-        # When the MCP SDK sees a registration_endpoint it performs dynamic client
-        # registration and requires the OAuth provider to implement saveClientInformation().
-        # Dust's MCPOAuthProvider does NOT implement saveClientInformation(), so
-        # including registration_endpoint triggers:
-        #   "OAuth client information must be saveable for dynamic registration"
-        # Without registration_endpoint the SDK skips that step entirely and goes
-        # straight to the authorization flow using the pre-configured client_id.
+        "registration_endpoint": f"{base}/oauth/register",
         "grant_types_supported": ["authorization_code"],
         "response_types_supported": ["code"],
         "token_endpoint_auth_methods_supported": [
@@ -201,7 +199,12 @@ async def oauth_metadata(request: Request) -> JSONResponse:
 
 async def oauth_register(request: Request) -> JSONResponse:
     """RFC 7591 — Dynamic Client Registration.
-    Dust s'enregistre ici automatiquement pour obtenir un client_id/secret.
+
+    Handles both confidential clients (with client_secret) and public clients
+    (token_endpoint_auth_method=none, no secret). Dust registers as a public
+    client, so we return no secret in that case — this lets Dust store just the
+    client_id, which MCPOAuthProvider.clientInformation() returns successfully
+    on subsequent calls, bypassing the saveClientInformation requirement.
     """
     try:
         body = await request.json()
@@ -209,26 +212,41 @@ async def oauth_register(request: Request) -> JSONResponse:
         body = {}
 
     client_id = secrets.token_urlsafe(16)
-    client_secret = secrets.token_urlsafe(32)
-
-    _dynamic_clients[client_id] = {
-        "client_secret": client_secret,
-        "redirect_uris": body.get("redirect_uris", []),
-        "registered_at": time.time(),
-    }
+    auth_method = body.get("token_endpoint_auth_method", "client_secret_post")
+    is_public = auth_method == "none"
 
     now = int(time.time())
-    return JSONResponse({
+    response_body: dict = {
         "client_id": client_id,
-        "client_secret": client_secret,
         "client_id_issued_at": now,
-        "client_secret_expires_at": 0,          # 0 = never expires (RFC 7591 §3.2.1)
         "redirect_uris": body.get("redirect_uris", []),
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
-        "token_endpoint_auth_method": "client_secret_post",
-        "scope": "mcp",
-    }, status_code=201)
+        "token_endpoint_auth_method": auth_method,
+        "scope": body.get("scope", "mcp"),
+    }
+
+    if is_public:
+        # Public client — no secret issued (RFC 7591 §2, §3.2.1)
+        _dynamic_clients[client_id] = {
+            "client_secret": None,
+            "redirect_uris": body.get("redirect_uris", []),
+            "registered_at": time.time(),
+            "public": True,
+        }
+    else:
+        # Confidential client — issue a secret
+        client_secret = secrets.token_urlsafe(32)
+        _dynamic_clients[client_id] = {
+            "client_secret": client_secret,
+            "redirect_uris": body.get("redirect_uris", []),
+            "registered_at": time.time(),
+            "public": False,
+        }
+        response_body["client_secret"] = client_secret
+        response_body["client_secret_expires_at"] = 0  # 0 = never expires (RFC 7591 §3.2.1)
+
+    return JSONResponse(response_body, status_code=201)
 
 
 async def oauth_authorize(request: Request) -> Response:
