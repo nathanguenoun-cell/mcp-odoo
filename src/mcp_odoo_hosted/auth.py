@@ -148,11 +148,11 @@ def _is_url_client_id(client_id: str) -> bool:
 
 
 def _client_exists(client_id: str) -> bool:
-    return (
-        client_id == settings.oauth_client_id
-        or client_id in _dynamic_clients
-        or _is_url_client_id(client_id)
-    )
+    # Accept any non-empty client_id: since we don't advertise a
+    # registration_endpoint, clients bring their own pre-configured client_id.
+    # Dust uses token_endpoint_auth_method="none" (public client, no secret),
+    # so we cannot validate the client by secret anyway.
+    return bool(client_id)
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +178,15 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "authorization_endpoint": f"{base}/oauth/authorize",
         "token_endpoint": f"{base}/oauth/token",
         "revocation_endpoint": f"{base}/oauth/revoke",
-        "registration_endpoint": f"{base}/oauth/register",
-        "grant_types_supported": ["authorization_code", "client_credentials"],
+        # NOTE: registration_endpoint is intentionally omitted.
+        # When the MCP SDK sees a registration_endpoint it performs dynamic client
+        # registration and requires the OAuth provider to implement saveClientInformation().
+        # Dust's MCPOAuthProvider does NOT implement saveClientInformation(), so
+        # including registration_endpoint triggers:
+        #   "OAuth client information must be saveable for dynamic registration"
+        # Without registration_endpoint the SDK skips that step entirely and goes
+        # straight to the authorization flow using the pre-configured client_id.
+        "grant_types_supported": ["authorization_code"],
         "response_types_supported": ["code"],
         "token_endpoint_auth_methods_supported": [
             "client_secret_post",
@@ -189,10 +196,6 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "code_challenge_methods_supported": ["S256", "plain"],
         "scopes_supported": ["mcp"],
         "subject_types_supported": ["public"],
-        # SEP-991: URL-based client IDs — allows clients whose provider does not
-        # implement saveClientInformation (e.g. Dust) to skip dynamic registration
-        # and use their own clientMetadataUrl as the client_id instead.
-        "client_id_metadata_document_supported": True,
     })
 
 
