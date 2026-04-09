@@ -126,6 +126,12 @@ def create_app() -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
+        if not settings.server_url:
+            raise RuntimeError(
+                "SERVER_URL environment variable is required but not set. "
+                "Set it to the public Railway URL of this service "
+                "(e.g. https://xxx.up.railway.app)."
+            )
         logger.info("=" * 50)
         logger.info("MCP Odoo Hosted — démarrage")
         logger.info("Endpoint MCP   : %s/mcp", settings.server_url or "<auto-detected from request>")
