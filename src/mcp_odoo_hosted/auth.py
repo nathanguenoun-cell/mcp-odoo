@@ -142,8 +142,17 @@ def _validate_client(client_id: str, client_secret: str) -> bool:
     return False
 
 
+def _is_url_client_id(client_id: str) -> bool:
+    """SEP-991: client_id is a URL pointing to the client's metadata document."""
+    return client_id.startswith("https://")
+
+
 def _client_exists(client_id: str) -> bool:
-    return client_id == settings.oauth_client_id or client_id in _dynamic_clients
+    return (
+        client_id == settings.oauth_client_id
+        or client_id in _dynamic_clients
+        or _is_url_client_id(client_id)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +189,10 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "code_challenge_methods_supported": ["S256", "plain"],
         "scopes_supported": ["mcp"],
         "subject_types_supported": ["public"],
+        # SEP-991: URL-based client IDs — allows clients whose provider does not
+        # implement saveClientInformation (e.g. Dust) to skip dynamic registration
+        # and use their own clientMetadataUrl as the client_id instead.
+        "client_id_metadata_document_supported": True,
     })
 
 
@@ -321,8 +334,9 @@ async def oauth_token(request: Request) -> JSONResponse:
                 return JSONResponse({"error": "invalid_grant",
                                      "error_description": "PKCE invalide"}, status_code=400)
 
-        # Validation client (optionnelle pour les clients publics PKCE)
-        if client_secret and not _validate_client(client_id, client_secret):
+        # Validate client secret when present; skip for URL-based client IDs (SEP-991)
+        # which are public clients with no secret.
+        if client_secret and not _is_url_client_id(client_id) and not _validate_client(client_id, client_secret):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         entry["used"] = True
