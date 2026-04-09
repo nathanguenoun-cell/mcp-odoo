@@ -76,11 +76,13 @@ def _base_url(request: Request) -> str:
 
 _redis_client: Optional[aioredis.Redis] = None
 
-_KEY_CLIENT = "mcp:oauth:client:"   # mcp:oauth:client:{client_id} → JSON
-_KEY_CODE = "mcp:oauth:code:"       # mcp:oauth:code:{code} → JSON, TTL 300s
-_KEY_REVOKED = "mcp:oauth:revoked"  # Redis Set of revoked JTIs
+_KEY_CLIENT = "mcp:oauth:client:"    # mcp:oauth:client:{client_id} → JSON
+_KEY_CODE = "mcp:oauth:code:"        # mcp:oauth:code:{code} → JSON, TTL 300s
+_KEY_REFRESH = "mcp:oauth:refresh:"  # mcp:oauth:refresh:{token} → JSON, TTL 30d
+_KEY_REVOKED = "mcp:oauth:revoked"   # Redis Set of revoked JTIs
 
-_CODE_TTL = 300  # seconds
+_CODE_TTL = 300              # 5 minutes
+_REFRESH_TTL = 30 * 24 * 3600  # 30 days
 
 
 def _get_redis() -> Optional[aioredis.Redis]:
@@ -98,6 +100,7 @@ def _get_redis() -> Optional[aioredis.Redis]:
 
 _clients_mem: dict[str, dict] = {}
 _codes_mem: dict[str, dict] = {}
+_refresh_mem: dict[str, dict] = {}
 _revoked_jtis_mem: set[str] = set()  # also used as local cache when Redis is on
 
 
@@ -162,6 +165,38 @@ async def _update_code(code: str, data: dict) -> None:
         except Exception:
             logger.exception("Redis error updating code, falling back to memory")
     _codes_mem[code] = data
+
+
+async def _store_refresh_token(token: str, data: dict) -> None:
+    r = _get_redis()
+    if r:
+        try:
+            await r.setex(_KEY_REFRESH + token, _REFRESH_TTL, json.dumps(data))
+            return
+        except Exception:
+            logger.exception("Redis error storing refresh token, falling back to memory")
+    _refresh_mem[token] = data
+
+
+async def _get_refresh_token(token: str) -> Optional[dict]:
+    r = _get_redis()
+    if r:
+        try:
+            raw = await r.get(_KEY_REFRESH + token)
+            return json.loads(raw) if raw else None
+        except Exception:
+            logger.exception("Redis error fetching refresh token, falling back to memory")
+    return _refresh_mem.get(token)
+
+
+async def _delete_refresh_token(token: str) -> None:
+    r = _get_redis()
+    if r:
+        try:
+            await r.delete(_KEY_REFRESH + token)
+        except Exception:
+            logger.exception("Redis error deleting refresh token")
+    _refresh_mem.pop(token, None)
 
 
 async def _revoke_jti(jti: str) -> None:
@@ -320,7 +355,7 @@ async def oauth_metadata(request: Request) -> JSONResponse:
         "token_endpoint": f"{base}/oauth/token",
         "revocation_endpoint": f"{base}/oauth/revoke",
         "registration_endpoint": f"{base}/oauth/register",
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "response_types_supported": ["code"],
         "token_endpoint_auth_methods_supported": [
             "client_secret_post",
@@ -349,7 +384,7 @@ async def oauth_register(request: Request) -> JSONResponse:
         "client_id": client_id,
         "client_id_issued_at": now,
         "redirect_uris": body.get("redirect_uris", []),
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": auth_method,
         "scope": body.get("scope", "mcp"),
@@ -489,16 +524,62 @@ async def oauth_token(request: Request) -> JSONResponse:
         entry["used"] = True
         await _update_code(code, entry)
 
-        token = _create_access_token(
+        access_token = _create_access_token(
             sub=entry["odoo_username"],
             odoo_username=entry["odoo_username"],
             odoo_api_key=entry["odoo_api_key"],
         )
+        refresh_token = secrets.token_urlsafe(32)
+        await _store_refresh_token(refresh_token, {
+            "client_id": client_id,
+            "odoo_username": entry["odoo_username"],
+            "odoo_api_key": entry["odoo_api_key"],
+            "scope": "mcp",
+        })
         return JSONResponse({
-            "access_token": token,
+            "access_token": access_token,
             "token_type": "bearer",
             "expires_in": settings.access_token_expire_minutes * 60,
+            "refresh_token": refresh_token,
             "scope": "mcp",
+        })
+
+    # ── Refresh Token flow (RFC 6749 §6) ──────────────────────────────────
+    if grant_type == "refresh_token":
+        refresh_token_str = str(form.get("refresh_token", "")).strip()
+        if not refresh_token_str:
+            return JSONResponse({"error": "invalid_request",
+                                 "error_description": "refresh_token manquant"}, status_code=400)
+
+        rt_entry = await _get_refresh_token(refresh_token_str)
+        if not rt_entry:
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "Refresh token inconnu ou expiré"}, status_code=400)
+        if rt_entry["client_id"] != client_id:
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "Client mismatch"}, status_code=400)
+
+        # Rotate: delete old refresh token, issue new pair
+        await _delete_refresh_token(refresh_token_str)
+
+        new_access_token = _create_access_token(
+            sub=rt_entry["odoo_username"],
+            odoo_username=rt_entry["odoo_username"],
+            odoo_api_key=rt_entry["odoo_api_key"],
+        )
+        new_refresh_token = secrets.token_urlsafe(32)
+        await _store_refresh_token(new_refresh_token, {
+            "client_id": client_id,
+            "odoo_username": rt_entry["odoo_username"],
+            "odoo_api_key": rt_entry["odoo_api_key"],
+            "scope": rt_entry.get("scope", "mcp"),
+        })
+        return JSONResponse({
+            "access_token": new_access_token,
+            "token_type": "bearer",
+            "expires_in": settings.access_token_expire_minutes * 60,
+            "refresh_token": new_refresh_token,
+            "scope": rt_entry.get("scope", "mcp"),
         })
 
     # ── Client Credentials flow ────────────────────────────────────────────
@@ -521,12 +602,23 @@ async def oauth_token(request: Request) -> JSONResponse:
 
 
 async def oauth_revoke(request: Request) -> Response:
-    """RFC 7009 — Token Revocation."""
+    """RFC 7009 — Token Revocation. Accepts both access tokens and refresh tokens."""
     form = await request.form()
     token = str(form.get("token", "")).strip()
+    token_type_hint = str(form.get("token_type_hint", "")).strip()
+
+    # Try as refresh token first when hinted, or always try both
+    if token_type_hint != "access_token":
+        rt_entry = await _get_refresh_token(token)
+        if rt_entry:
+            await _delete_refresh_token(token)
+            return Response(status_code=200)
+
+    # Try as JWT access token
     payload = _decode_token(token)
     if payload and payload.get("jti"):
         await _revoke_jti(payload["jti"])
+
     return Response(status_code=200)
 
 
