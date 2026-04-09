@@ -33,12 +33,14 @@ import hashlib
 import json
 import logging
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
 import redis.asyncio as aioredis
+from cachetools import TTLCache
 from jose import JWTError, jwt
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -95,13 +97,25 @@ def _get_redis() -> Optional[aioredis.Redis]:
 
 
 # ---------------------------------------------------------------------------
-# In-memory fallback stores (used when Redis is disabled)
+# In-memory fallback stores — TTLCache so entries expire automatically
+# even without Redis (avoids unbounded growth and stale-entry bugs).
 # ---------------------------------------------------------------------------
 
-_clients_mem: dict[str, dict] = {}
-_codes_mem: dict[str, dict] = {}
-_refresh_mem: dict[str, dict] = {}
-_revoked_jtis_mem: set[str] = set()  # also used as local cache when Redis is on
+# Auth codes: 5-minute TTL, max 1 000 concurrent flows
+_codes_mem: TTLCache = TTLCache(maxsize=1_000, ttl=_CODE_TTL)
+_codes_mem_lock = threading.Lock()
+
+# Registered clients: 24-hour TTL, max 10 000 clients
+_clients_mem: TTLCache = TTLCache(maxsize=10_000, ttl=86_400)
+
+# Refresh tokens: 30-day TTL, max 10 000 tokens
+_refresh_mem: TTLCache = TTLCache(maxsize=10_000, ttl=_REFRESH_TTL)
+
+# Revoked JTIs: TTL matches access-token lifetime so the set stays bounded
+_revoked_jtis_mem: TTLCache = TTLCache(
+    maxsize=100_000,
+    ttl=settings.access_token_expire_minutes * 60,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +152,8 @@ async def _store_code(code: str, data: dict) -> None:
             return
         except Exception:
             logger.exception("Redis error storing code, falling back to memory")
-    _codes_mem[code] = data
+    with _codes_mem_lock:
+        _codes_mem[code] = data
 
 
 async def _get_code(code: str) -> Optional[dict]:
@@ -164,7 +179,8 @@ async def _update_code(code: str, data: dict) -> None:
             return
         except Exception:
             logger.exception("Redis error updating code, falling back to memory")
-    _codes_mem[code] = data
+    with _codes_mem_lock:
+        _codes_mem[code] = data
 
 
 async def _store_refresh_token(token: str, data: dict) -> None:
@@ -200,7 +216,7 @@ async def _delete_refresh_token(token: str) -> None:
 
 
 async def _revoke_jti(jti: str) -> None:
-    _revoked_jtis_mem.add(jti)
+    _revoked_jtis_mem[jti] = True
     r = _get_redis()
     if r:
         try:
@@ -217,7 +233,7 @@ async def _is_jti_revoked(jti: str) -> bool:
         try:
             result = await r.sismember(_KEY_REVOKED, jti)
             if result:
-                _revoked_jtis_mem.add(jti)  # cache locally
+                _revoked_jtis_mem[jti] = True  # cache locally
             return bool(result)
         except Exception:
             logger.exception("Redis error checking JTI revocation")
@@ -278,10 +294,11 @@ async def verify_token_async(token: str) -> Optional[dict]:
 # Keep a sync version for backward compatibility (skips Redis revocation check,
 # relies on local cache populated by previous async calls).
 def verify_token(token: str) -> Optional[dict]:
+    """Sync version — uses local TTLCache only (no Redis round-trip)."""
     payload = _decode_token(token)
     if payload is None:
         return None
-    if payload.get("jti") in _revoked_jtis_mem:
+    if _revoked_jtis_mem.get(payload.get("jti")):
         return None
     return payload
 
@@ -507,6 +524,12 @@ async def oauth_token(request: Request) -> JSONResponse:
             return JSONResponse({"error": "invalid_grant",
                                  "error_description": "Client mismatch"}, status_code=400)
 
+        # Validate redirect_uri matches what was used in the authorization request (RFC 6749 §4.1.3)
+        redirect_uri_from_request = str(form.get("redirect_uri", "")).strip()
+        if redirect_uri_from_request and entry["redirect_uri"] != redirect_uri_from_request:
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "redirect_uri mismatch"}, status_code=400)
+
         # Vérification PKCE si utilisée
         if entry.get("code_challenge"):
             if not code_verifier:
@@ -535,6 +558,7 @@ async def oauth_token(request: Request) -> JSONResponse:
             "odoo_username": entry["odoo_username"],
             "odoo_api_key": entry["odoo_api_key"],
             "scope": "mcp",
+            "expires_at": time.time() + (settings.refresh_token_expire_days * 86_400),
         })
         return JSONResponse({
             "access_token": access_token,
@@ -558,27 +582,22 @@ async def oauth_token(request: Request) -> JSONResponse:
         if rt_entry["client_id"] != client_id:
             return JSONResponse({"error": "invalid_grant",
                                  "error_description": "Client mismatch"}, status_code=400)
+        if time.time() > rt_entry["expires_at"]:
+            await _delete_refresh_token(refresh_token_str)
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "Refresh token expiré"}, status_code=400)
 
-        # Rotate: delete old refresh token, issue new pair
-        await _delete_refresh_token(refresh_token_str)
-
+        # Issue new access token; keep same refresh token (rolling refresh)
         new_access_token = _create_access_token(
             sub=rt_entry["odoo_username"],
             odoo_username=rt_entry["odoo_username"],
             odoo_api_key=rt_entry["odoo_api_key"],
         )
-        new_refresh_token = secrets.token_urlsafe(32)
-        await _store_refresh_token(new_refresh_token, {
-            "client_id": client_id,
-            "odoo_username": rt_entry["odoo_username"],
-            "odoo_api_key": rt_entry["odoo_api_key"],
-            "scope": rt_entry.get("scope", "mcp"),
-        })
         return JSONResponse({
             "access_token": new_access_token,
             "token_type": "bearer",
             "expires_in": settings.access_token_expire_minutes * 60,
-            "refresh_token": new_refresh_token,
+            "refresh_token": refresh_token_str,  # same token — rolling refresh
             "scope": rt_entry.get("scope", "mcp"),
         })
 

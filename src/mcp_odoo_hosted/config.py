@@ -22,7 +22,8 @@ class Settings(BaseSettings):
         description="Secret key for signing JWT access tokens",
     )
     jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 60
+    access_token_expire_minutes: int = 60  # minimum 60
+    refresh_token_expire_days: int = 30
 
     # OAuth client credentials — set OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET in Railway
     # If not set, they are derived deterministically from jwt_secret_key so they
