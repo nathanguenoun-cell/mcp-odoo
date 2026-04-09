@@ -47,6 +47,15 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from .config import settings
 from .context import odoo_api_key_var, odoo_username_var
 
+# ---------------------------------------------------------------------------
+# MCP SDK auth integration (optional — gracefully absent in older SDK builds)
+# ---------------------------------------------------------------------------
+try:
+    from mcp.server.auth.provider import AccessToken as _MCPAccessToken
+    _MCP_AUTH_AVAILABLE = True
+except ImportError:
+    _MCP_AUTH_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -519,6 +528,32 @@ async def oauth_revoke(request: Request) -> Response:
     if payload and payload.get("jti"):
         await _revoke_jti(payload["jti"])
     return Response(status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# MCP SDK TokenVerifier implementation
+# ---------------------------------------------------------------------------
+
+class OdooMCPTokenVerifier:
+    """Implements the MCP SDK TokenVerifier protocol using our JWT logic.
+
+    Passed to FastMCP(token_verifier=...) so the SDK treats the /mcp endpoint
+    as an OAuth-protected resource and validates Bearer tokens at the MCP layer.
+    """
+
+    async def verify_token(self, token: str) -> Optional[object]:
+        if not _MCP_AUTH_AVAILABLE:
+            return None
+        payload = await verify_token_async(token)
+        if payload is None:
+            return None
+        scopes = payload.get("scope", "mcp").split()
+        return _MCPAccessToken(
+            token=token,
+            client_id=payload.get("sub", ""),
+            scopes=scopes,
+            expires_at=payload.get("exp"),
+        )
 
 
 # ---------------------------------------------------------------------------

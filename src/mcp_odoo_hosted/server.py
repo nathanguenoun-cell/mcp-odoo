@@ -27,6 +27,7 @@ from starlette.routing import Mount, Route
 
 from .auth import (
     BearerTokenMiddleware,
+    OdooMCPTokenVerifier,
     oauth_authorize,
     oauth_metadata,
     oauth_protected_resource_metadata,
@@ -39,18 +40,40 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# FastMCP instance
+# FastMCP instance + MCP SDK auth configuration
 # ---------------------------------------------------------------------------
+# Configure FastMCP with a TokenVerifier so the SDK treats /mcp as an
+# OAuth-protected resource and validates Bearer tokens at the MCP layer.
+# Falls back gracefully if the installed SDK version doesn't support auth.
 
-mcp = FastMCP(
-    name="mcp-odoo",
-    instructions=(
+_mcp_kwargs: dict = {
+    "name": "mcp-odoo",
+    "instructions": (
         "You are connected to an Odoo ERP instance. "
         "You can manage timesheets, expenses, contacts, invoices, sales orders, "
         "products, and HR records on behalf of the authenticated user."
     ),
-    stateless_http=True,
-)
+    "stateless_http": True,
+}
+
+if settings.server_url:
+    try:
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+        _mcp_kwargs["auth"] = AuthSettings(
+            issuer_url=settings.server_url,  # type: ignore[arg-type]
+            resource_server_url=f"{settings.server_url}/mcp",  # type: ignore[arg-type]
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=["mcp"],
+                default_scopes=["mcp"],
+            ),
+        )
+        _mcp_kwargs["token_verifier"] = OdooMCPTokenVerifier()
+        logger.info("MCP SDK auth configured with TokenVerifier")
+    except Exception as exc:
+        logger.warning("MCP SDK auth not available, falling back to middleware-only auth: %s", exc)
+
+mcp = FastMCP(**_mcp_kwargs)
 
 # ---------------------------------------------------------------------------
 # Enregistrement des outils
